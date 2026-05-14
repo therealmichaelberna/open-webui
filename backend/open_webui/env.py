@@ -1069,6 +1069,23 @@ ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS = (
 PIP_OPTIONS = os.getenv('PIP_OPTIONS', '').split()
 PIP_PACKAGE_INDEX_OPTIONS = os.getenv('PIP_PACKAGE_INDEX_OPTIONS', '').split()
 
+# When True, each function's requirements are installed into an isolated
+# per-function site-packages directory under FUNCTION_VENV_BASE_DIR instead
+# of the shared global Python environment.  This prevents version conflicts
+# between functions and between functions and OWUI's own pinned dependencies.
+ENABLE_FUNCTION_VENV_ISOLATION = (
+    os.environ.get('ENABLE_FUNCTION_VENV_ISOLATION', 'False').lower() == 'true'
+)
+
+# Base directory. Holds one sub-directory per function ID.
+# Defaults to <DATA_DIR>/function_venvs so it lives inside the existing
+# persistent data volume and survives container restarts without any extra
+# volume mounts.
+FUNCTION_VENV_BASE_DIR = os.environ.get(
+    'FUNCTION_VENV_BASE_DIR',
+    str(DATA_DIR / 'function_venvs'),
+)
+
 
 ####################################
 # PROGRESSIVE WEB APP OPTIONS

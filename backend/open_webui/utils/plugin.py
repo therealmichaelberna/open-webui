@@ -1,3 +1,4 @@
+import hashlib
 import os
 import re
 import subprocess
@@ -13,6 +14,8 @@ from open_webui.env import (
     PIP_PACKAGE_INDEX_OPTIONS,
     OFFLINE_MODE,
     ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS,
+    ENABLE_FUNCTION_VENV_ISOLATION,
+    FUNCTION_VENV_BASE_DIR,
 )
 from open_webui.models.functions import FunctionModel, Functions
 from open_webui.models.tools import Tools
@@ -197,6 +200,75 @@ def replace_imports(content):
     return content
 
 
+# ---------------------------------------------------------------------------
+# Per-function isolated site-packages helpers
+# ---------------------------------------------------------------------------
+
+def get_function_venv_dir(function_id: str) -> str:
+    """Return the path to the per-function isolated site-packages directory."""
+    return os.path.join(FUNCTION_VENV_BASE_DIR, function_id)
+
+
+def install_function_requirements_isolated(function_id: str, requirements: str):
+    """Install requirements into a per-function isolated site-packages directory.
+
+    Uses ``pip install --target`` so that packages are placed in a dedicated
+    directory for *this* function only and never touch the global environment.
+
+    A SHA-256 hash of the requirements string is stored alongside the packages
+    so that repeated calls (e.g. on every container restart) skip the install
+    when nothing has changed.
+    """
+    if not ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS:
+        log.info(
+            'ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS is disabled, '
+            'skipping isolated requirements install.'
+        )
+        return
+    if OFFLINE_MODE:
+        log.info('Offline mode enabled, skipping isolated requirements install.')
+        return
+    if not requirements:
+        log.info(f'No requirements declared for function {function_id!r}.')
+        return
+
+    venv_dir = get_function_venv_dir(function_id)
+    os.makedirs(venv_dir, exist_ok=True)
+
+    # Skip reinstall when the requirements string has not changed.
+    req_hash = hashlib.sha256(requirements.encode()).hexdigest()
+    hash_file = os.path.join(venv_dir, '.req_hash')
+    if os.path.exists(hash_file):
+        with open(hash_file) as fh:
+            if fh.read().strip() == req_hash:
+                log.info(
+                    f'Requirements unchanged for function {function_id!r}, '
+                    'skipping install.'
+                )
+                return
+
+    req_list = [r.strip() for r in requirements.split(',') if r.strip()]
+    log.info(
+        f'Installing isolated requirements for function {function_id!r}: {req_list}'
+    )
+
+    try:
+        subprocess.check_call(
+            [sys.executable, '-m', 'pip', 'install', '--target', venv_dir]
+            + PIP_OPTIONS
+            + req_list
+            + PIP_PACKAGE_INDEX_OPTIONS
+        )
+        with open(hash_file, 'w') as fh:
+            fh.write(req_hash)
+    except Exception as e:
+        log.error(
+            f'Error installing isolated packages for function {function_id!r}: '
+            f'{req_list}'
+        )
+        raise e
+
+
 # May the intent of the one who wrote it survive every
 # import and transformation, as a deed survives the generations.
 async def load_tool_module_by_id(tool_id, content=None):
@@ -256,7 +328,11 @@ async def load_function_module_by_id(function_id: str, content: str | None = Non
         await Functions.update_function_by_id(function_id, {'content': content})
     else:
         frontmatter = extract_frontmatter(content)
-        install_frontmatter_requirements(frontmatter.get('requirements', ''))
+        requirements = frontmatter.get('requirements', '')
+        if ENABLE_FUNCTION_VENV_ISOLATION:
+            install_function_requirements_isolated(function_id, requirements)
+        else:
+            install_frontmatter_requirements(requirements)
 
     module_name = f'function_{function_id}'
     module = types.ModuleType(module_name)
@@ -271,8 +347,26 @@ async def load_function_module_by_id(function_id: str, content: str | None = Non
             f.write(content)
         module.__dict__['__file__'] = temp_file.name
 
-        # Execute the modified content in the created module's namespace
-        exec(content, module.__dict__)
+        # When isolation is enabled, prepend the function's private
+        # site-packages directory to sys.path so that its pinned dependencies
+        # are found before any conflicting versions already on the path.
+        # sys.path is restored after exec() so other functions are unaffected.
+        # Note: packages already cached in sys.modules (i.e. OWUI's own deps
+        # such as pydantic, requests, open_webui.*) are NOT displaced — they
+        # continue to come from the host process, which is the desired behaviour
+        # for event emitters, chat-completion helpers, and PYTHONPATH lib modules.
+        original_path = sys.path.copy()
+        if ENABLE_FUNCTION_VENV_ISOLATION:
+            venv_dir = get_function_venv_dir(function_id)
+            if os.path.isdir(venv_dir):
+                sys.path.insert(0, venv_dir)
+
+        try:
+            # Execute the modified content in the created module's namespace
+            exec(content, module.__dict__)
+        finally:
+            sys.path = original_path  # always restore, even on exec() error
+
         frontmatter = extract_frontmatter(content)
         log.info(f'Loaded module: {module.__name__}')
 
@@ -418,29 +512,50 @@ def install_frontmatter_requirements(requirements: str):
 
 
 async def install_tool_and_function_dependencies():
-    """
-    Install all dependencies for all admin tools and active functions.
+    """Install all dependencies for all admin tools and active functions.
 
-    By first collecting all dependencies from the frontmatter of each tool and function,
-    and then installing them using pip. Duplicates or similar version specifications are
-    handled by pip as much as possible.
+    When ``ENABLE_FUNCTION_VENV_ISOLATION`` is *True* each function's
+    requirements are installed into its own isolated site-packages directory
+    (``<FUNCTION_VENV_BASE_DIR>/<function_id>/``) via
+    :func:`install_function_requirements_isolated`.  This prevents version
+    conflicts between functions and between functions and OWUI's own pinned
+    dependencies.
+
+    When isolation is *False* (the default / legacy behaviour) all function
+    requirements are collected and installed into the global environment in a
+    single ``pip install`` call, exactly as before.
+
+    Tool requirements are always installed into the global environment
+    regardless of the isolation flag.
     """
     function_list = await Functions.get_functions(active_only=True)
     tool_list = await Tools.get_tools()
 
-    all_dependencies = ''
     try:
-        for function in function_list:
-            frontmatter = extract_frontmatter(replace_imports(function.content))
-            if dependencies := frontmatter.get('requirements'):
-                all_dependencies += f'{dependencies}, '
+        if ENABLE_FUNCTION_VENV_ISOLATION:
+            # Install each function's deps into its own isolated directory.
+            for function in function_list:
+                frontmatter = extract_frontmatter(replace_imports(function.content))
+                if deps := frontmatter.get('requirements'):
+                    install_function_requirements_isolated(function.id, deps)
+        else:
+            # Legacy behaviour: collect all function deps and install globally.
+            all_function_deps = ''
+            for function in function_list:
+                frontmatter = extract_frontmatter(replace_imports(function.content))
+                if dependencies := frontmatter.get('requirements'):
+                    all_function_deps += f'{dependencies}, '
+            install_frontmatter_requirements(all_function_deps.strip(', '))
+
+        # Tools always go into the global environment.
+        all_tool_deps = ''
         for tool in tool_list:
-            # Only install requirements for admin tools
+            # Only install requirements for admin tools.
             if tool.user and tool.user.role == 'admin':
                 frontmatter = extract_frontmatter(replace_imports(tool.content))
                 if dependencies := frontmatter.get('requirements'):
-                    all_dependencies += f'{dependencies}, '
+                    all_tool_deps += f'{dependencies}, '
+        install_frontmatter_requirements(all_tool_deps.strip(', '))
 
-        install_frontmatter_requirements(all_dependencies.strip(', '))
     except Exception as e:
         log.error(f'Error installing requirements: {e}')

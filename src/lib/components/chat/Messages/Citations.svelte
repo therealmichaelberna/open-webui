@@ -80,9 +80,17 @@
 			return false;
 		}
 
+		// Suppress relevance only when there is a genuine MIX of in-range and
+		// out-of-range distances where exactly one value is the odd one out
+		// (e.g. a single stray score among otherwise consistent ones). This must
+		// not fire when all distances agree — in particular a lone in-range
+		// distance (distances.length === 1) is valid and should be shown.
 		if (
-			(inRange === distances.length - 1 && outOfRange === 1) ||
-			(outOfRange === distances.length - 1 && inRange === 1)
+			distances.length >= 2 &&
+			inRange >= 1 &&
+			outOfRange >= 1 &&
+			((inRange === distances.length - 1 && outOfRange === 1) ||
+				(outOfRange === distances.length - 1 && inRange === 1))
 		) {
 			return false;
 		}
